@@ -2,239 +2,284 @@ import pandas as pd
 from pathlib import Path
 
 
-# -----------------------------
-# LOAD DATA
-# -----------------------------
+# LOAD SONG DATABASE
 
 dataset_path = Path(__file__).parent / "dataset.csv"
+
 songs = pd.read_csv(dataset_path)
 
-# Clean dataset
-songs = songs.drop_duplicates(subset=["track_name", "artists"])
+songs = songs.drop_duplicates(
+    subset=["track_name", "artists"]
+)
 
 songs = songs.dropna(
     subset=[
         "track_name",
         "artists",
-        "track_genre",
         "energy",
         "valence",
-        "danceability"
+        "danceability",
+        "popularity"
     ]
 )
 
 
-# -----------------------------
-# BUSY SCORE -> MUSIC TARGETS
-# -----------------------------
+# CALENDAR -> MUSIC CHARACTERISTICS
 
 def get_music_targets(busy_score):
 
-    # Keep busy score between 0 and 100
     busy_score = max(0, min(100, busy_score))
 
-    # Busier day -> more energetic music
-    target_energy = 0.30 + (busy_score / 100) * 0.60
+    # Busy day -> calmer music
+    # Light day -> more energetic music
 
-    # Busier day -> slightly more upbeat music
-    target_valence = 0.45 + (busy_score / 100) * 0.30
+    target_energy = (
+        0.90 - (busy_score / 100) * 0.60
+    )
 
-    # Busier day -> somewhat more danceable music
-    target_danceability = 0.45 + (busy_score / 100) * 0.35
+    target_valence = (
+        0.80 - (busy_score / 100) * 0.35
+    )
 
-    return target_energy, target_valence, target_danceability
+    target_danceability = (
+        0.85 - (busy_score / 100) * 0.35
+    )
+
+    return (
+        target_energy,
+        target_valence,
+        target_danceability
+    )
 
 
-# -----------------------------
-# SONG RECOMMENDER
-# -----------------------------
+# MARK FAMILIAR MUSIC
 
-def recommend_songs(
-    busy_score,
+def mark_familiar(
+    data,
     favorite_artists,
-    favorite_genres,
-    top_n=10
+    favorite_tracks
 ):
 
-    recommendations = songs.copy()
+    data = data.copy()
 
-    # Convert preferences to lowercase
-    favorite_artists_lower = [
-        artist.lower() for artist in favorite_artists
-    ]
+    favorite_artists = {
+        artist.lower().strip()
+        for artist in favorite_artists
+    }
 
-    favorite_genres_lower = [
-        genre.lower() for genre in favorite_genres
-    ]
+    favorite_tracks = {
+        track.lower().strip()
+        for track in favorite_tracks
+    }
 
+    def artist_is_familiar(artist_string):
 
-    # -----------------------------
-    # FIND SONGS USER WOULD LIKE
-    # -----------------------------
+        artists = {
+            artist.strip()
+            for artist
+            in artist_string.lower().split(";")
+        }
 
-    recommendations["artist_match"] = (
-        recommendations["artists"]
-        .str.lower()
-        .apply(
-            lambda artists: any(
-                artist.strip() in favorite_artists_lower
-                for artist in artists.split(";")
-            )
+        return bool(
+            artists & favorite_artists
         )
+
+    data["artist_familiar"] = (
+        data["artists"]
+        .apply(artist_is_familiar)
     )
 
-    recommendations["genre_match"] = (
-        recommendations["track_genre"]
+    data["track_familiar"] = (
+        data["track_name"]
         .str.lower()
-        .isin(favorite_genres_lower)
+        .str.strip()
+        .isin(favorite_tracks)
     )
 
+    # For the demo, familiarity is based on
+    # whether the user already listens to the artist.
+    data["familiar"] = data["artist_familiar"]
 
-    # Only consider songs matching
-    # at least one user preference
-    recommendations = recommendations[
-        recommendations["artist_match"]
-        | recommendations["genre_match"]
-    ].copy()
+    return data
 
 
-    # -----------------------------
-    # GET CALENDAR MUSIC TARGET
-    # -----------------------------
+# SCORE MUSIC CHARACTERISTICS
 
-    target_energy, target_valence, target_danceability = (
-        get_music_targets(busy_score)
-    )
+def score_music(data, busy_score):
 
+    data = data.copy()
 
-    # -----------------------------
-    # CALCULATE MUSIC MATCHES
-    # -----------------------------
+    (
+        target_energy,
+        target_valence,
+        target_danceability
+    ) = get_music_targets(busy_score)
 
-    recommendations["energy_match"] = (
+    data["energy_match"] = (
         1 - abs(
-            recommendations["energy"]
+            data["energy"]
             - target_energy
         )
     )
 
-    recommendations["valence_match"] = (
+    data["valence_match"] = (
         1 - abs(
-            recommendations["valence"]
+            data["valence"]
             - target_valence
         )
     )
 
-    recommendations["danceability_match"] = (
+    data["danceability_match"] = (
         1 - abs(
-            recommendations["danceability"]
+            data["danceability"]
             - target_danceability
         )
     )
 
+    data["popularity_score"] = (
+        data["popularity"] / 100
+    )
 
-    # -----------------------------
-    # PREFERENCE SCORE
-    # -----------------------------
+    data["score"] = (
+        0.40 * data["energy_match"]
+        + 0.20 * data["valence_match"]
+        + 0.20 * data["danceability_match"]
+        + 0.20 * data["popularity_score"]
+    )
 
-    recommendations["preference_score"] = (
-        recommendations["artist_match"].astype(int) * 0.60
-        +
-        recommendations["genre_match"].astype(int) * 0.40
+    return data
+
+
+# MAIN RECOMMENDATION FUNCTION
+
+def recommend_songs(
+    busy_score,
+    favorite_artists,
+    favorite_tracks,
+    top_n=10
+):
+
+    recommendations = mark_familiar(
+        songs,
+        favorite_artists,
+        favorite_tracks
+    )
+
+    recommendations = score_music(
+        recommendations,
+        busy_score
     )
 
 
-    # -----------------------------
-    # POPULARITY
-    # -----------------------------
+    # FAMILIAR VS DISCOVERY
+    # Busier day -> more familiar artists
+    # Lighter day -> more discovery artists
 
-    recommendations["popularity_score"] = (
-        recommendations["popularity"] / 100
+    familiar_ratio = busy_score / 100
+
+    familiar_count = round(
+        top_n * familiar_ratio
+    )
+
+    discovery_count = (
+        top_n - familiar_count
     )
 
 
-    # -----------------------------
-    # FINAL SCORE
-    # -----------------------------
+    # FAMILIAR SONGS
 
-    recommendations["score"] = (
-        0.35 * recommendations["preference_score"]
-        + 0.30 * recommendations["energy_match"]
-        + 0.15 * recommendations["valence_match"]
-        + 0.10 * recommendations["danceability_match"]
-        + 0.10 * recommendations["popularity_score"]
-    )
+    familiar = recommendations[
+        recommendations["familiar"]
+    ]
 
-
-    # Highest score first
-    recommendations = recommendations.sort_values(
+    familiar = familiar.sort_values(
         "score",
         ascending=False
     )
 
+    familiar = familiar.head(
+        familiar_count
+    )
 
-    return recommendations[
+
+    # DISCOVERY SONGS
+
+    discovery = recommendations[
+        ~recommendations["familiar"]
+    ]
+
+    discovery = discovery.sort_values(
+        "score",
+        ascending=False
+    )
+
+    discovery = discovery.head(
+        discovery_count
+    )
+
+
+    # COMBINE RESULTS
+
+    final = pd.concat(
+        [familiar, discovery]
+    )
+
+    # Shuffle so familiar/discovery
+    # aren't shown in separate chunks
+
+    final = final.sample(
+        frac=1,
+        random_state=42
+    )
+
+
+    return final[
         [
             "track_name",
             "artists",
-            "track_genre",
             "energy",
             "valence",
             "danceability",
             "popularity",
+            "familiar",
             "score"
         ]
-    ].head(top_n)
+    ]
 
 
-# -----------------------------
 # TEST
-# -----------------------------
 
 if __name__ == "__main__":
 
-    # TEMPORARY:
-    # your partner's calendar code will replace this
+    from user_profile import (
+        FAVORITE_ARTISTS,
+        FAVORITE_TRACKS
+    )
+
     busy_score = 80
-
-    # TEMPORARY:
-    # frontend will eventually provide these
-    favorite_artists = [
-        "SZA",
-        "Frank Ocean",
-        "Beyonce"
-    ]
-
-    favorite_genres = [
-        "r-n-b",
-        "pop"
-    ]
-
 
     recommendations = recommend_songs(
         busy_score,
-        favorite_artists,
-        favorite_genres,
-        top_n=10
+        FAVORITE_ARTISTS,
+        FAVORITE_TRACKS
     )
 
-
-    energy, valence, danceability = (
-        get_music_targets(busy_score)
-    )
-
-
-    print("\nBUSY SCORE:", busy_score)
-
-    print("\nMUSIC TARGET:")
-    print("Energy:", round(energy, 2))
-    print("Valence:", round(valence, 2))
     print(
-        "Danceability:",
-        round(danceability, 2)
+        "\nBUSY SCORE:",
+        busy_score
     )
 
-    print("\nRECOMMENDED SONGS:\n")
+    print(
+        f"FAMILIAR: {busy_score}%"
+    )
+
+    print(
+        f"DISCOVERY: {100 - busy_score}%"
+    )
+
+    print(
+        "\nRECOMMENDED SONGS:\n"
+    )
 
     print(
         recommendations.to_string(
